@@ -180,7 +180,13 @@ def _save_vspin_calibrations(device_id, remainder: int):
 
 
 FULL_ROTATION: int = 8000
+OLD_FIRMWARE_COMMAND_GAP_SECONDS: float = 0.05
+OLD_FIRMWARE_HOMING_TIMEOUT_SECONDS: float = 60.0
+DOOR_UNLOCK_TO_OPEN_SETTLE_SECONDS: float = 0.5
+OLD_FIRMWARE_PNEUMATIC_SETTLE_SECONDS: float = 0.35
+OLD_FIRMWARE_POSITION_TOLERANCE: int = 25
 _KNOWN_VSPIN_STATUSES = {0x08, 0x09, 0x0B, 0x11, 0x13, 0x18, 0x19, 0x88, 0x89, 0x91, 0x99}
+_OLD_FIRMWARE_IDLE_STATUSES = {0x09, 0x0B, 0x11, 0x89, 0x91}
 
 _VSPIN_COMMAND_SET_ALIASES = {
   "agilent": "agilent",
@@ -222,6 +228,12 @@ def _with_vspin_checksum(cmd: bytes) -> bytes:
   return b"\xaa" + payload + bytes([sum(payload) & 0xFF])
 
 
+def _old_firmware_position_command(position: int) -> bytes:
+  position_bytes = int(position).to_bytes(4, byteorder="little")
+  payload = b"\x01\xd4\x97" + position_bytes + bytes.fromhex("c3f52800d71a0000")
+  return _with_vspin_checksum(b"\xaa" + payload + b"\x00")
+
+
 bucket_1_not_set_error = RuntimeError(
   "Bucket 1 position not set. "
   "Please rotate the bucket to bucket 1 using VSpinBackend.go_to_position and "
@@ -250,13 +262,22 @@ class VSpinBackend(CentrifugeBackend):
     self._command_set = _normalize_vspin_command_set(command_set)
     self.io = FTDI(human_readable_device_name="Agilent VSpin Centrifuge", device_id=device_id)
     self._bucket_1_remainder: Optional[int] = None
+    self._last_command_at = 0.0
     # only attempt loading calibration if device_id is not None
     # if it is None, we will load it after setup when we can query the device id from the io
     if device_id is not None:
       self._bucket_1_remainder = _load_vspin_calibrations(device_id)
 
+  @property
+  def _uses_old_firmware(self) -> bool:
+    return self._command_set == "old_firmware"
+
   async def setup(self):
     await self.io.setup()
+    if self._uses_old_firmware:
+      await self._setup_old_firmware()
+      return
+
     # TODO: add functionality where if robot has been initialized before nothing needs to happen
     for _ in range(3):
       await self.configure_and_initialize()
@@ -367,11 +388,165 @@ class VSpinBackend(CentrifugeBackend):
     return bucket_1_position
 
   async def stop(self):
+    if self._uses_old_firmware:
+      await self.io.stop()
+      return
+
     await self.configure_and_initialize()
     await self.io.stop()
 
   def _get_command_bytes(self, name: str) -> bytes:
     return _VSPIN_COMMANDS[self._command_set][name]
+
+  async def _setup_old_firmware(self) -> None:
+    await self.io.set_rts(True)
+    await self.io.set_dtr(True)
+    for _ in range(2):
+      await self.configure_and_initialize()
+
+    await self._send_command(bytes.fromhex("aa002101ff21"), read_timeout=0.6)
+    await self._send_command(bytes.fromhex("aa01132034"), read_timeout=0.6)
+    await self._send_command(bytes.fromhex("aa002102ff22"), read_timeout=0.6)
+    await self._send_command(bytes.fromhex("aa02132035"), read_timeout=0.6)
+    await self._send_command(bytes.fromhex("aa002103ff23"), read_timeout=0.15)
+    await self._drain_old_firmware(2.0)
+    await self._send_command(bytes.fromhex("aaff1a142d"), read_timeout=0.15)
+
+    await self.io.set_baudrate(57600)
+    await self.io.set_rts(True)
+    await self.io.set_dtr(True)
+
+    await self._enable_old_firmware_status()
+    await self._home_old_firmware()
+    await self._prime_old_firmware_io_status()
+    await self._wait_for_position_packet(timeout=10.0)
+
+    if self._bucket_1_remainder is None:
+      device_id = await self.io.get_serial()
+      self._bucket_1_remainder = _load_vspin_calibrations(device_id)
+
+  async def _drain_old_firmware(self, seconds: float) -> None:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+      await self._read_old_firmware_resp(timeout=0.08)
+      await asyncio.sleep(0.03)
+
+  async def _enable_old_firmware_status(self) -> None:
+    await self._send_command(bytes.fromhex("aa01121f32"), read_timeout=0.4)
+    for _ in range(8):
+      await self._send_command(bytes.fromhex("aa0220ff0f30"), read_timeout=0.15)
+    for cmd in (
+      bytes.fromhex("aa0220df0f10"),
+      bytes.fromhex("aa0220df0e0f"),
+      bytes.fromhex("aa0220df0c0d"),
+      bytes.fromhex("aa0220df0809"),
+    ):
+      await self._send_command(cmd, read_timeout=0.15)
+    for _ in range(4):
+      await self._send_command(bytes.fromhex("aa0226000028"), read_timeout=0.15)
+    await self._send_command(bytes.fromhex("aa02120317"), read_timeout=0.15)
+    await self._prime_old_firmware_io_status()
+
+  async def _home_old_firmware(self) -> None:
+    await self._send_command(bytes.fromhex("aa0226000028"))
+    await self._send_command(bytes.fromhex("aa0117021a"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa01e6c800b00496000f004b00a00f050007"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa0117041c"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa01170119"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa010b0c"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa010001"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa01e605006400000000003200e80301006e"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa0194b61283000012010000f3"), read_timeout=0.3)
+    await self._send_command(bytes.fromhex("aa01192842"), read_timeout=0.3)
+    await self._wait_for_position_packet(timeout=OLD_FIRMWARE_HOMING_TIMEOUT_SECONDS)
+
+  async def _wait_for_position_packet(self, timeout: float) -> "VSpinBackend._StatusPositionTachometer":
+    end = time.monotonic() + timeout
+    last_resp = b""
+    while time.monotonic() < end:
+      for cmd in (bytes.fromhex("aa010e0f"), bytes.fromhex("aa01121f32")):
+        resp = await self._send_command(cmd, read_timeout=0.5)
+        last_resp = resp
+        status = self._find_status_packet(resp)
+        if status is not None and status.home_position != 0:
+          return status
+      await asyncio.sleep(0.1)
+    raise IOError(f"Invalid status from centrifuge: {last_resp.hex()}")
+
+  async def _lock_door_during_setup(self) -> None:
+    if self._uses_old_firmware:
+      await self._send_command(self._get_command_bytes("lock_door"))
+      await asyncio.sleep(0.35)
+      return
+    await self.lock_door()
+
+  async def _prime_old_firmware_io_status(self) -> None:
+    for _ in range(5):
+      await self._send_command(self._get_command_bytes("unlock_bucket"))
+      await self._send_command(bytes.fromhex("aa020e10"))
+      await self._send_command(self._get_command_bytes("lock_door"))
+      await self._send_command(bytes.fromhex("aa020e10"))
+    await self._send_command(self._get_command_bytes("lock_bucket"))
+    await self._send_command(bytes.fromhex("aa020e10"))
+    await self._send_command(self._get_command_bytes("lock_door"))
+    await self._send_command(bytes.fromhex("aa020e10"))
+
+  @staticmethod
+  def _find_status_byte(resp: bytes) -> Optional[int]:
+    for value in resp:
+      if value in _KNOWN_VSPIN_STATUSES:
+        return value
+    return None
+
+  async def _get_rotor_status(self) -> int:
+    resp = await self._send_command(bytes.fromhex("aa010e0f"))
+    full_status = self._find_status_packet(resp)
+    if full_status is not None:
+      return full_status.status
+    short_status = self._find_status_byte(resp)
+    if short_status is None:
+      raise IOError(f"Invalid status from centrifuge: {resp.hex()}")
+    return short_status
+
+  async def _wait_until_status_changes_from(self, status: int, label: str) -> None:
+    end = time.monotonic() + OLD_FIRMWARE_HOMING_TIMEOUT_SECONDS
+    last_status = status
+    while time.monotonic() < end:
+      try:
+        last_status = await self._get_rotor_status()
+      except IOError:
+        await asyncio.sleep(0.1)
+        continue
+      if last_status != status:
+        return
+      await asyncio.sleep(0.1)
+    raise TimeoutError(f"VSpin {label} did not finish; last status=0x{last_status:02x}")
+
+  async def _wait_until_status_is(self, status: int, label: str) -> None:
+    end = time.monotonic() + OLD_FIRMWARE_HOMING_TIMEOUT_SECONDS
+    last_status = 0
+    while time.monotonic() < end:
+      try:
+        last_status = await self._get_rotor_status()
+      except IOError:
+        await asyncio.sleep(0.1)
+        continue
+      if last_status == status or (
+        self._uses_old_firmware and status == 0x09 and last_status in _OLD_FIRMWARE_IDLE_STATUSES
+      ):
+        return
+      await asyncio.sleep(0.1)
+    raise TimeoutError(f"VSpin {label} did not reach status 0x{status:02x}; last=0x{last_status:02x}")
+
+  async def _wait_until_stopped(self, timeout: float = 60.0) -> None:
+    end = time.monotonic() + timeout
+    last_rpm = 0.0
+    while time.monotonic() < end:
+      last_rpm = abs(await self.get_tachometer())
+      if last_rpm < 30:
+        return
+      await asyncio.sleep(0.5)
+    raise TimeoutError(f"VSpin did not stop within {timeout:.1f}s; last rpm={last_rpm:.1f}")
 
   class _StatusPositionTachometer(ctypes.LittleEndianStructure):
     _pack_ = 1
@@ -423,6 +598,10 @@ class VSpinBackend(CentrifugeBackend):
     if len(resp) == 0:
       raise IOError("Empty status from centrifuge")
     status = self._find_status_packet(resp)
+    if status is None and self._uses_old_firmware:
+      status = self._find_status_packet(
+        await self._send_command(bytes.fromhex("aa01121f32"), read_timeout=0.4)
+      )
     if status is None:
       raise IOError(f"Invalid status from centrifuge: {resp.hex()}")
     return status
@@ -446,10 +625,20 @@ class VSpinBackend(CentrifugeBackend):
     - 0080f0015
     """
 
-    resp = await self._send_command(bytes.fromhex("aa020e10"))
+    for _ in range(5 if self._uses_old_firmware else 1):
+      resp = await self._send_command(
+        bytes.fromhex("aa020e10"),
+        read_timeout=0.5 if self._uses_old_firmware else 0.2,
+      )
+      if len(resp) >= 3:
+        return resp
+      if not self._uses_old_firmware:
+        break
+      await asyncio.sleep(0.1)
+
     if len(resp) == 0:
       raise IOError("Empty status from centrifuge. Is the machine on?")
-    return resp
+    raise IOError(f"Invalid status from centrifuge: {resp.hex()}")
 
   async def get_bucket_locked(self) -> bool:
     resp = await self._get_status()
@@ -487,12 +676,38 @@ class VSpinBackend(CentrifugeBackend):
     logger.debug("Read %s", data.hex())
     return data
 
+  async def _read_old_firmware_resp(self, timeout: float) -> bytes:
+    data = b""
+    start_time = time.monotonic()
+    last_data_time: Optional[float] = None
+
+    while time.monotonic() - start_time <= timeout:
+      chunk = await self.io.read(25)
+      if chunk:
+        data += chunk
+        last_data_time = time.monotonic()
+      elif data and last_data_time is not None and time.monotonic() - last_data_time > 0.03:
+        break
+      else:
+        await asyncio.sleep(0.003)
+
+    logger.debug("Read %s", data.hex())
+    return data
+
   async def _send_command(self, cmd: bytes, read_timeout=0.2) -> bytes:
     cmd = _with_vspin_checksum(bytes(cmd))
+    if self._uses_old_firmware:
+      command_gap = OLD_FIRMWARE_COMMAND_GAP_SECONDS - (time.monotonic() - self._last_command_at)
+      if command_gap > 0:
+        await asyncio.sleep(command_gap)
+
     written = await self.io.write(cmd)
+    self._last_command_at = time.monotonic()
 
     if written != len(cmd):
       raise RuntimeError("Failed to write all bytes")
+    if self._uses_old_firmware:
+      return await self._read_old_firmware_resp(timeout=read_timeout)
     return await self._read_resp(timeout=read_timeout)
 
   async def configure_and_initialize(self):
@@ -508,16 +723,22 @@ class VSpinBackend(CentrifugeBackend):
 
   async def initialize(self):
     await self.io.write(b"\x00" * 20)
+    if self._uses_old_firmware:
+      await asyncio.sleep(0.01)
     for i in range(33):
       packet = b"\xaa" + bytes([i & 0xFF, 0x0E, 0x0E + (i & 0xFF)]) + b"\x00" * 8
       await self.io.write(packet)
-    await self._send_command(bytes.fromhex("aaff0f0e"))
+      if self._uses_old_firmware:
+        await asyncio.sleep(0.01)
+    await self._send_command(bytes.fromhex("aaff0f0e"), read_timeout=0.08 if self._uses_old_firmware else 0.2)
 
   # Centrifuge operations
 
   async def open_door(self):
     if await self.get_door_open():
       return
+    if self._uses_old_firmware and await self.get_door_locked():
+      await self.unlock_door()
     await self._send_command(self._get_command_bytes("open_door"))  # same as unlock door on new firmware
 
     # we can't tell when the door is fully open, so we just wait a bit
@@ -536,21 +757,29 @@ class VSpinBackend(CentrifugeBackend):
     if await self.get_door_locked():
       return
     await self._send_command(self._get_command_bytes("lock_door"))
+    if self._uses_old_firmware:
+      await asyncio.sleep(OLD_FIRMWARE_PNEUMATIC_SETTLE_SECONDS)
 
   async def unlock_door(self):
     if not await self.get_door_locked():
       return
     await self._send_command(self._get_command_bytes("unlock_door"))  # same as close door
+    if self._uses_old_firmware:
+      await asyncio.sleep(DOOR_UNLOCK_TO_OPEN_SETTLE_SECONDS)
 
   async def lock_bucket(self):
     if await self.get_bucket_locked():
       return
     await self._send_command(self._get_command_bytes("lock_bucket"))
+    if self._uses_old_firmware:
+      await asyncio.sleep(OLD_FIRMWARE_PNEUMATIC_SETTLE_SECONDS)
 
   async def unlock_bucket(self):
     if not await self.get_bucket_locked():
       return
     await self._send_command(self._get_command_bytes("unlock_bucket"))  # same as open door on new firmware
+    if self._uses_old_firmware:
+      await asyncio.sleep(OLD_FIRMWARE_PNEUMATIC_SETTLE_SECONDS)
 
   async def go_to_bucket1(self):
     await self.go_to_position(await self.get_bucket_1_position())
@@ -561,12 +790,18 @@ class VSpinBackend(CentrifugeBackend):
   async def go_to_position(self, position: int):
     await self.close_door()
     await self.lock_door()
+    if self._uses_old_firmware and await self.get_bucket_locked():
+      await self.unlock_bucket()
 
     position_bytes = position.to_bytes(4, byteorder="little")
-    byte_string = _with_vspin_checksum(
-      bytes.fromhex("aa01d497") + position_bytes + bytes.fromhex("c3f52800d71a0000")
-    )
-    await self._send_command(bytes.fromhex("aa0226000028"))
+    if self._uses_old_firmware:
+      byte_string = _old_firmware_position_command(position)
+    else:
+      byte_string = _with_vspin_checksum(
+        bytes.fromhex("aa01d497") + position_bytes + bytes.fromhex("c3f52800d71a0000")
+      )
+    if not self._uses_old_firmware:
+      await self._send_command(bytes.fromhex("aa0226000028"))
     await self._send_command(bytes.fromhex("aa0117021a"))
     await self._send_command(bytes.fromhex("aa01e6c800b00496000f004b00a00f050007"))
     await self._send_command(bytes.fromhex("aa0117041c"))
@@ -576,9 +811,8 @@ class VSpinBackend(CentrifugeBackend):
     await self._send_command(byte_string)
 
     # await self._send_command(bytes.fromhex("aa0117021a"))
-    while (
-      abs(await self.get_position() - position) > 10
-    ):  # 10 tacks tolerance (10/8000 * 360 = 0.45 degrees)
+    tolerance = OLD_FIRMWARE_POSITION_TOLERANCE if self._uses_old_firmware else 10
+    while abs(await self.get_position() - position) > tolerance:
       await asyncio.sleep(0.1)
     await self.open_door()
 
@@ -618,7 +852,12 @@ class VSpinBackend(CentrifugeBackend):
       await self.close_door()
     if not await self.get_door_locked():
       await self.lock_door()
-    if await self.get_bucket_locked():
+    if self._uses_old_firmware:
+      await self._send_command(self._get_command_bytes("lock_bucket"))
+      await asyncio.sleep(OLD_FIRMWARE_PNEUMATIC_SETTLE_SECONDS)
+      await self._send_command(self._get_command_bytes("unlock_bucket"))
+      await asyncio.sleep(OLD_FIRMWARE_PNEUMATIC_SETTLE_SECONDS)
+    elif await self.get_bucket_locked():
       await self.unlock_bucket()
 
     # 1 - compute the final position
@@ -655,7 +894,8 @@ class VSpinBackend(CentrifugeBackend):
       bytes.fromhex("aa01d497") + position_b + rpm_b + acceleration_b + b"\x00"
     )
 
-    await self._send_command(bytes.fromhex("aa0226000028"))
+    if not self._uses_old_firmware:
+      await self._send_command(bytes.fromhex("aa0226000028"))
     await self._send_command(bytes.fromhex("aa0117021a"))
     await self._send_command(bytes.fromhex("aa01e6c800b00496000f004b00a00f050007"))
     await self._send_command(bytes.fromhex("aa0117041c"))
@@ -721,6 +961,9 @@ class VSpinBackend(CentrifugeBackend):
         await _reset_to_zero()
       if num_tries > 100:
         raise RuntimeError("Home position did not change after spin.")
+
+    if self._uses_old_firmware:
+      await self._wait_until_stopped()
 
 
 # Deprecated alias with warning # TODO: remove mid May 2025 (giving people 1 month to update)

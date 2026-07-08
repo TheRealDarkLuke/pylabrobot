@@ -1,7 +1,11 @@
 import unittest
 from unittest import mock
 
-from pylabrobot.centrifuge.vspin_backend import VSpinBackend, _with_vspin_checksum
+from pylabrobot.centrifuge.vspin_backend import (
+  DOOR_UNLOCK_TO_OPEN_SETTLE_SECONDS,
+  VSpinBackend,
+  _with_vspin_checksum,
+)
 
 
 # status=0x11, current_position=12070, tachometer=-10, home_position=6733, checksum=0x29
@@ -13,6 +17,13 @@ def _make_backend(io: mock.Mock) -> VSpinBackend:
   backend.io = io
   backend._command_set = "agilent"
   backend._bucket_1_remainder = None
+  backend._last_command_at = 0.0
+  return backend
+
+
+def _make_old_backend(io: mock.Mock) -> VSpinBackend:
+  backend = _make_backend(io)
+  backend._command_set = "old_firmware"
   return backend
 
 
@@ -61,6 +72,29 @@ class VSpinCommandSetTests(unittest.IsolatedAsyncioTestCase):
 
     io.write.assert_awaited_once_with(bytes.fromhex("aa020e10"))
 
+  async def test_old_firmware_send_command_does_not_wait_for_carriage_return(self):
+    io = mock.Mock()
+    io.read = mock.AsyncMock(side_effect=[bytes.fromhex("0080d00151"), *([b""] * 20)])
+    io.write = mock.AsyncMock(return_value=4)
+    backend = _make_old_backend(io)
+
+    response = await backend._send_command(bytes.fromhex("aa020e00"), read_timeout=0.04)
+
+    self.assertEqual(response, bytes.fromhex("0080d00151"))
+    io.write.assert_awaited_once_with(bytes.fromhex("aa020e10"))
+
+  async def test_old_firmware_unlock_door_waits_before_opening(self):
+    backend = _make_old_backend(mock.Mock())
+    backend.get_door_locked = mock.AsyncMock(return_value=True)
+    backend._send_command = mock.AsyncMock()
+    sleep = mock.AsyncMock()
+
+    with mock.patch("asyncio.sleep", sleep):
+      await backend.unlock_door()
+
+    backend._send_command.assert_awaited_once_with(bytes.fromhex("aa022600042c"))
+    sleep.assert_awaited_once_with(DOOR_UNLOCK_TO_OPEN_SETTLE_SECONDS)
+
   def test_find_status_packet_parses_status_packet(self):
     parsed = VSpinBackend._find_status_packet(_STATUS_PACKET)
 
@@ -75,3 +109,6 @@ class VSpinCommandSetTests(unittest.IsolatedAsyncioTestCase):
     packet[-1] ^= 0xFF
 
     self.assertIsNone(VSpinBackend._find_status_packet(bytes(packet)))
+
+  def test_find_status_byte_accepts_short_old_firmware_status(self):
+    self.assertEqual(VSpinBackend._find_status_byte(bytes.fromhex("890808080849")), 0x89)
